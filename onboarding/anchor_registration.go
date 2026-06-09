@@ -1,0 +1,140 @@
+/*
+FILE PATH: onboarding/anchor_registration.go
+DESCRIPTION: Publishes the first anchor entry from a newly-provisioned county
+
+	log to its parent (state) log. The state ledger watches for this anchor
+	to admit the county into the network.
+
+KEY ARCHITECTURAL DECISIONS:
+  - Uses anchor.BuildCosignedAnchorEntry (self-contained cosigned_tree_head_v1
+    commentary, zero SMT impact) — the SAME format the SDK owns for every
+    anchor, so the state ledger verifies the county head's quorum offline.
+  - Fetches the county log's initial cosigned tree head via TreeHeadClient
+    (the head that includes the provisioning entries — scope entity,
+    delegations, schemas).
+  - Returns the anchor entry for submission to the state log by the caller.
+
+OVERVIEW: RegisterFirstAnchor wraps topology/anchor_publisher for onboarding.
+KEY DEPENDENCIES: baseproof/anchor, baseproof/witness, baseproof/crypto/cosign
+*/
+package onboarding
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	"time"
+
+	"github.com/baseproof/baseproof/anchor"
+	"github.com/baseproof/baseproof/core/envelope"
+	"github.com/baseproof/baseproof/crypto/cosign"
+	sdklog "github.com/baseproof/baseproof/log"
+)
+
+// AnchorRegistrationConfig configures the initial anchor publication.
+type AnchorRegistrationConfig struct {
+	Destination string // DID of target exchange. Required.
+	// CountyLedgerDID signs the anchor entry.
+	CountyLedgerDID string
+
+	// CountyLogDID is the newly-provisioned county log being anchored.
+	CountyLogDID string
+
+	// ParentLogDID is the state log receiving the anchor.
+	ParentLogDID string
+
+	// NetworkID binds the tree-head reference hash to a specific
+	// network/fork. Required: TreeHeadDigest rejects the zero value.
+	NetworkID cosign.NetworkID
+
+	// EventTime overrides the anchor timestamp. Zero → time.Now().
+	EventTime int64
+}
+
+// AnchorRegistrationResult holds the anchor entry + metadata.
+type AnchorRegistrationResult struct {
+	AnchorEntry *envelope.Entry
+	TreeHeadRef string
+	TreeSize    uint64
+
+	// TargetLogDID is where the caller must submit AnchorEntry.
+	// Equals cfg.ParentLogDID for clarity.
+	TargetLogDID string
+}
+
+// RegisterFirstAnchor fetches the county log's initial tree head and
+// builds an anchor entry for submission to the state log.
+//
+// Preconditions: the county log must have processed its provisioning
+// entries and produced a cosigned tree head (TreeHeadClient can fetch it).
+// If the county's tree head isn't available yet, this returns an error —
+// the caller retries after the county ledger publishes its first head.
+func RegisterFirstAnchor(
+	ctx context.Context,
+	cfg AnchorRegistrationConfig,
+	cp *sdklog.ResolvingCheckpointClient,
+	set *cosign.WitnessKeySet,
+) (*AnchorRegistrationResult, error) {
+	if cfg.CountyLedgerDID == "" {
+		return nil, fmt.Errorf("onboarding/anchor_registration: empty county ledger DID")
+	}
+	if cfg.CountyLogDID == "" || cfg.ParentLogDID == "" {
+		return nil, fmt.Errorf("onboarding/anchor_registration: both log DIDs required")
+	}
+	if cp == nil {
+		return nil, fmt.Errorf("onboarding/anchor_registration: nil checkpoint client")
+	}
+	if set == nil {
+		return nil, fmt.Errorf("onboarding/anchor_registration: nil witness key set for %s", cfg.CountyLogDID)
+	}
+
+	eventTime := cfg.EventTime
+	if eventTime == 0 {
+		eventTime = time.Now().UTC().UnixMicro()
+	}
+
+	// Fetch the county log's PUBLISHED, witness-cosigned horizon (the durable
+	// checkpoint that includes the provisioning entries), not the live head — so
+	// the embedded head the state log verifies offline carries a full K-of-N quorum.
+	head, err := cp.FetchVerifiedHorizon(ctx, cfg.CountyLogDID, set)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"onboarding/anchor_registration: county log %s has no verified horizon yet: %w",
+			cfg.CountyLogDID, err,
+		)
+	}
+	if head.TreeSize == 0 {
+		return nil, fmt.Errorf(
+			"onboarding/anchor_registration: county log %s tree size is 0 (provisioning incomplete)",
+			cfg.CountyLogDID,
+		)
+	}
+
+	// Compute tree head reference hash. Network-bound by construction:
+	// cosign.TreeHeadDigest mixes in NetworkID, so the same bytes under
+	// a different network produce a distinct digest.
+	headHash, err := cosign.TreeHeadDigest(head.TreeHead, cfg.NetworkID)
+	if err != nil {
+		return nil, fmt.Errorf("onboarding/anchor_registration: tree head digest: %w", err)
+	}
+	headRef := hex.EncodeToString(headHash[:])
+
+	entry, err := anchor.BuildCosignedAnchorEntry(anchor.CosignedAnchorParams{
+		Destination:  cfg.Destination,
+		SignerDID:    cfg.CountyLedgerDID,
+		SourceLogDID: cfg.CountyLogDID,
+		Head:         head,
+		NetworkID:    cfg.NetworkID,
+		EventTime:    eventTime,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("onboarding/anchor_registration: build anchor: %w", err)
+	}
+
+	return &AnchorRegistrationResult{
+		AnchorEntry:  entry,
+		TreeHeadRef:  headRef,
+		TreeSize:     head.TreeSize,
+		TargetLogDID: cfg.ParentLogDID,
+	}, nil
+}

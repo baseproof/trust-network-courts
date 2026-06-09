@@ -1,0 +1,45 @@
+name: sdk-version-pin
+
+# D10 — pin the baseproof SDK + tooling libs versions JN consumes so a
+# stray bump (manual or automated) fails the PR rather than landing
+# silently. The pins are the contract the migration plan in issue #61
+# enforces: every JN package is verified against this exact pair.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REQUIRED_BASEPROOF_VERSION: v0.0.4-rc2
+  REQUIRED_LIBS_VERSION: v0.1.6
+
+jobs:
+  sdk-version-pin:
+    name: SDK + libs version pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: assert baseproof + tooling/libs pins
+        run: |
+          set -euo pipefail
+
+          actual_baseproof=$(grep -E '^\s+github.com/baseproof/baseproof v' go.mod | head -1 | awk '{print $2}')
+          if [[ "$actual_baseproof" != "${REQUIRED_BASEPROOF_VERSION}" ]]; then
+            echo "::error file=go.mod::baseproof pinned to ${actual_baseproof}, want ${REQUIRED_BASEPROOF_VERSION}"
+            echo "::error::SDK version drift: see https://github.com/baseproof/trust-network-courts/issues/61"
+            exit 1
+          fi
+          echo "✓ baseproof @ ${actual_baseproof}"
+
+          actual_libs=$(grep -E '^\s+github.com/baseproof/tooling/libs v' go.mod | head -1 | awk '{print $2}')
+          if [[ "$actual_libs" != "${REQUIRED_LIBS_VERSION}" ]]; then
+            echo "::error file=go.mod::tooling/libs pinned to ${actual_libs}, want ${REQUIRED_LIBS_VERSION}"
+            echo "::error::libs version drift: see https://github.com/baseproof/trust-network-courts/issues/61"
+            exit 1
+          fi
+          echo "✓ tooling/libs @ ${actual_libs}"

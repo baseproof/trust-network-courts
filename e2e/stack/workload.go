@@ -1,0 +1,265 @@
+package stack
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"github.com/baseproof/trust-network-courts/e2e/dockerx"
+)
+
+// Mode-A credit identifiers (harness-owned: a bearer token + a credit-account DID,
+// not protocol DIDs the ledger verifies cryptographically).
+func creditToken() string       { return env("E2E_CREDIT_TOKEN", "baseproof-mode-a") }
+func creditExchangeDID() string { return env("E2E_CREDIT_EXCHANGE_DID", "did:web:baseproof:exchange") }
+func creditAmount() string      { return env("E2E_CREDITS", "1000000000") }
+
+// Target is one network's addressable surface for seeding, workloads, and audit.
+type Target struct {
+	Network     string // docker network
+	LedgerName  string // ledger container name (in-network URL)
+	LedgerPort  int    // host port (health/head polls)
+	ReaderPort  int    // host port for the PG-off read front (ledger-reader); 0 when not launched
+	JNPort      int    // host port for the JN enforcer edge (0 when no JN)
+	LogDID      string
+	QuorumK     int
+	FixturesDir string // host fixtures dir (the /out + audit mount)
+	CertsDir    string // host certs dir (the run CA the tools pin to verify the ledger)
+	Admission   string // credits|pow
+	DB          string // per-network Postgres database (rebuild target for federation.dr)
+	Bucket      string // per-network object-store bucket (rebuild source for federation.dr)
+}
+
+func (t Target) innerURL() string { return "https://" + t.LedgerName + ":8080" }
+
+// tlsArgs are the ledger client tools' open-HTTPS flags — submit-stamp/backfill/
+// audit all bind -ca-cert + -allow-self-signed (verify the ledger's self-signed
+// server cert against the run CA, present NO client cert) and infer https from
+// the -url scheme. The ledger serves reads openly and gates writes on in-body
+// crypto, so the tools need no client cert. The CA is mounted at mntCerts.
+func tlsArgs() []string {
+	return []string{
+		"-ca-cert", mntCerts + "/ca.crt",
+		"-allow-self-signed",
+	}
+}
+
+// certsMount mounts the run's TLS material (the CA the tools pin) read-only into
+// a tool container.
+func certsMount(t Target) dockerx.Mount {
+	return dockerx.Mount{Host: t.CertsDir, Container: mntCerts + ":ro"}
+}
+
+// SeedOnUp makes the persisted stack immediately usable: it seeds Mode-A credits
+// (when admission=credits), submits the genesis-seed entry, and waits for the
+// K-cosigned head.
+func SeedOnUp(in Infra, nc NetConfig, fixturesDir, certsDir, ledgerImage string) error {
+	if nc.Tuning.Admission == "credits" {
+		if err := seedCredits(in, nc.DB); err != nil {
+			return err
+		}
+	}
+	t := nc.target(fixturesDir, certsDir)
+	if err := SubmitStamp(t, ledgerImage, "genesis-seed"); err != nil {
+		return fmt.Errorf("seed submit: %w", err)
+	}
+	if !poll(120*time.Second, func() bool {
+		sz, sigs := HeadStatus(certsDir, nc.LedgerPort)
+		return sz >= 1 && sigs >= nc.Spec.QuorumK
+	}) {
+		return fmt.Errorf("seed: tree head not cosigned (size>=1, sigs>=%d)", nc.Spec.QuorumK)
+	}
+	return nil
+}
+
+func (nc NetConfig) target(fixturesDir, certsDir string) Target {
+	return Target{
+		Network: nc.Network, LedgerName: nc.Name("ledger"), LedgerPort: nc.LedgerPort, ReaderPort: nc.ReaderPort, JNPort: nc.JNPort,
+		LogDID: nc.LogDID, QuorumK: nc.Spec.QuorumK, FixturesDir: fixturesDir, CertsDir: certsDir, Admission: nc.Tuning.Admission,
+		DB: nc.DB, Bucket: nc.Bucket,
+	}
+}
+
+// seedCredits upserts a Mode-A bearer session + a write-credit balance (the two
+// rows cmd/seed-session writes), so submissions skip PoW. Idempotent.
+func seedCredits(in Infra, db string) error {
+	did, tok, amt := creditExchangeDID(), creditToken(), creditAmount()
+	q1 := fmt.Sprintf("INSERT INTO sessions (token, exchange_did, expires_at) "+
+		"VALUES ('%s','%s',NOW()+INTERVAL '24 hours') "+
+		"ON CONFLICT (token) DO UPDATE SET exchange_did=EXCLUDED.exchange_did, expires_at=EXCLUDED.expires_at;", tok, did)
+	q2 := fmt.Sprintf("INSERT INTO credits (exchange_did, balance, total_purchased, updated_at) "+
+		"VALUES ('%s',%s,%s,NOW()) "+
+		"ON CONFLICT (exchange_did) DO UPDATE SET balance=credits.balance+%s, total_purchased=credits.total_purchased+%s, updated_at=NOW();",
+		did, amt, amt, amt, amt)
+	if _, ok := dockerx.PGQuery(in.PG(), pgUser, db, q1); !ok {
+		return fmt.Errorf("seed session row")
+	}
+	if _, ok := dockerx.PGQuery(in.PG(), pgUser, db, q2); !ok {
+		return fmt.Errorf("seed credit balance")
+	}
+	return nil
+}
+
+// SubmitStamp submits one commentary entry via the ledger image's /submit-stamp.
+func SubmitStamp(t Target, ledgerImage, payload string) error {
+	args := append([]string{"-url", t.innerURL()}, tlsArgs()...)
+	args = append(args, "-log-did", t.LogDID, "-payload", payload)
+	if t.Admission == "credits" {
+		args = append(args, "-token", creditToken())
+	}
+	r := dockerx.Run(dockerx.RunSpec{
+		Network: t.Network, Image: ledgerImage, Remove: true, Entrypoint: "/submit-stamp",
+		Mounts:    []dockerx.Mount{certsMount(t)},
+		ImageArgs: args,
+	})
+	if !r.OK() {
+		return fmt.Errorf("submit-stamp %q: %s", payload, tail(r.Stderr, 300))
+	}
+	return nil
+}
+
+// HeadStatus reads /v1/tree/head → (tree_size, signature count) over the open-HTTPS host port.
+func HeadStatus(certsDir string, ledgerPort int) (int, int) {
+	body := ledgerBody(certsDir, fmt.Sprintf("https://localhost:%d/v1/tree/head", ledgerPort))
+	if body == "" {
+		return 0, 0
+	}
+	var h struct {
+		TreeSize   int               `json:"tree_size"`
+		Signatures []json.RawMessage `json:"signatures"`
+	}
+	if json.Unmarshal([]byte(body), &h) != nil {
+		return 0, 0
+	}
+	return h.TreeSize, len(h.Signatures)
+}
+
+// LedgerHealthyPort probes the open-HTTPS /healthz over a host port (server-verify).
+func LedgerHealthyPort(certsDir string, ledgerPort int) bool {
+	return ledgerBody(certsDir, fmt.Sprintf("https://localhost:%d/healthz", ledgerPort)) == "ok"
+}
+
+// WaitDrained waits until the committed head reaches target tree_size.
+func WaitDrained(certsDir string, ledgerPort, target int, timeout time.Duration) bool {
+	return poll(timeout, func() bool { sz, _ := HeadStatus(certsDir, ledgerPort); return sz >= target })
+}
+
+// BackfillStats is the subset of the backfill oracle manifest the runner asserts on.
+type BackfillStats struct {
+	Roots      int `json:"roots"`
+	Amendments int `json:"amendments"`
+	Leaves     []struct {
+		Key string `json:"key"`
+	} `json:"leaves"`
+}
+
+// Backfill loads n authority entries (roots + Path-A amendments) via the ledger
+// image's /backfill, writing the oracle manifest into the network's fixtures dir.
+// Output streams live (count/%/rate/ETA).
+func Backfill(t Target, ledgerImage string, n, workers int, amendRatio float64, batchSize int) (*BackfillStats, error) {
+	if workers < 1 {
+		workers = 8
+	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	if batchSize > 1 && t.Admission != "credits" {
+		return nil, fmt.Errorf("batch-size=%d requires admission=credits (Mode B PoW does not batch)", batchSize)
+	}
+	manifestHost := filepath.Join(t.FixturesDir, "backfill-manifest.json")
+	_ = os.Remove(manifestHost) // start each load with a clean oracle
+	args := append([]string{"-url", t.innerURL()}, tlsArgs()...)
+	args = append(args,
+		"-log-did", t.LogDID, "-n", strconv.Itoa(n),
+		"-amend-ratio", fmt.Sprintf("%g", amendRatio), "-seed", "1",
+		"-workers", strconv.Itoa(workers), "-manifest", mntOut+"/backfill-manifest.json",
+	)
+	if t.Admission == "credits" {
+		args = append(args, "-token", creditToken())
+	}
+	if batchSize > 1 {
+		args = append(args, "-batch-size", strconv.Itoa(batchSize), "-epoch", strconv.Itoa(max(64, workers*batchSize)))
+	}
+	bf := t.LedgerName + "-backfill"
+	// Reclaim the name before (re)launching: a prior run's OOM-killed (137) backfill
+	// can leave a Dead container that `docker rm -f` alone does not free, so a bare
+	// re-run hits a name Conflict. Reclaim force-removes AND verifies the name is
+	// gone, failing loudly if it is wedged.
+	if err := dockerx.Reclaim(bf); err != nil {
+		return nil, fmt.Errorf("backfill: %w", err)
+	}
+	if r := dockerx.Run(dockerx.RunSpec{
+		Name: bf, Network: t.Network, Image: ledgerImage, Detached: true, Entrypoint: "/backfill", User: uidGID(),
+		Mounts:    []dockerx.Mount{{Host: t.FixturesDir, Container: mntOut}, certsMount(t)},
+		ImageArgs: args,
+	}); !r.OK() {
+		return nil, fmt.Errorf("backfill start: %s", tail(r.Stderr, 300))
+	}
+	_ = dockerx.LogsFollow(bf)
+	code := dockerx.Wait(bf)
+	if code != "0" {
+		// Capture the container's own tail BEFORE removing it, and classify the exit
+		// so a SIGKILL/OOM (137) is not misreported as a stale image.
+		logs := tail(dockerx.Logs(bf), 1200)
+		dockerx.Remove(bf)
+		return nil, fmt.Errorf("backfill exited %s — %s\n--- backfill container tail ---\n%s",
+			code, backfillExitHint(code), logs)
+	}
+	dockerx.Remove(bf)
+	b, err := os.ReadFile(manifestHost)
+	if err != nil {
+		return nil, fmt.Errorf("backfill produced no manifest: %w", err)
+	}
+	var st BackfillStats
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, fmt.Errorf("parse backfill manifest: %w", err)
+	}
+	return &st, nil
+}
+
+// backfillExitHint maps a backfill container exit code to an actionable cause, so
+// a SIGKILL/OOM (137) or SIGTERM (143) is not misdiagnosed as "image predates
+// /backfill" — which is really only the entrypoint-missing (126/127) case.
+func backfillExitHint(code string) string {
+	switch code {
+	case "137":
+		return "SIGKILL: the backfill CLIENT was OOM-killed or `docker kill`ed (NOT a stale image; the ledger WRITE path is unaffected). Give the backfill container more memory, or lower -workers / split -n."
+	case "143":
+		return "SIGTERM: the backfill was terminated mid-load (shutdown or a timeout)."
+	case "125":
+		return "`docker run` itself failed (bad flags or resource limits) — the backfill never started."
+	case "126", "127":
+		return "entrypoint not executable / not found — the image likely predates /backfill."
+	default:
+		return "the backfill hit an error mid-load, or the ledger WRITE path is stuck — see the tail below."
+	}
+}
+
+// RunAudit runs the stateless light-client auditor against the persisted stack's
+// bootstrap and (optionally) the backfill oracle manifest. Returns the audit's
+// stdout and nil iff the audit PASSes; the output is also surfaced live.
+func RunAudit(t Target, ledgerImage string, samples, random int, withManifest bool) (string, error) {
+	args := append([]string{"-url", t.innerURL()}, tlsArgs()...)
+	args = append(args,
+		"-bootstrap", mntFixtures+"/network-bootstrap.json",
+		"-quorum", strconv.Itoa(t.QuorumK), "-samples", strconv.Itoa(samples), "-random", strconv.Itoa(random),
+	)
+	if withManifest {
+		args = append(args, "-manifest", mntFixtures+"/backfill-manifest.json")
+	}
+	r := dockerx.Run(dockerx.RunSpec{
+		Network: t.Network, Image: ledgerImage, Remove: true, Entrypoint: "/audit", User: uidGID(),
+		Mounts:    []dockerx.Mount{{Host: t.FixturesDir, Container: mntFixtures + ":ro"}, certsMount(t)},
+		ImageArgs: args,
+	})
+	if r.Stdout != "" {
+		fmt.Print(r.Stdout)
+	}
+	if !r.OK() {
+		return r.Stdout, fmt.Errorf("light-client audit FAILED:\n%s", tail(r.Stdout+r.Stderr, 800))
+	}
+	return r.Stdout, nil
+}

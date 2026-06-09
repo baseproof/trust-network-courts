@@ -1,0 +1,185 @@
+/*
+FILE PATH: verification/appellate_history.go
+
+DESCRIPTION:
+
+	Appeal chain reconstruction across logs. Topology-agnostic
+	after the v0.7.0 refactor: the walker follows cross-log
+	references for as many hops as exist, supporting any
+	appellate topology:
+
+	  TN COA only      trial → COA              (2-level)
+	  TN with Sup Ct   trial → COA → Sup Ct     (3-level)
+	  Federal          district → circuit       (2-level)
+	  Federal w/ SCOTUS district → circuit → SCOTUS (3-level)
+	  En-banc rehear   plus an extra link at any level
+
+	The chain length is the depth of the topology, not a fixed
+	constant. AppealStep.Step is the 1-indexed position; no
+	enumerated "Level" field.
+
+KEY ARCHITECTURAL DECISIONS:
+  - Walker is topology-agnostic: it terminates when a step's
+    cross-log proof has no successor, not when it reaches a
+    hard-coded "supreme" level.
+  - VerifyAppealChain re-verifies every cross-log proof
+    against the source log's witness key set.
+  - WalkAppealChain (NEW) constructs the chain by following
+    successor proofs supplied by a NextProofFn callback —
+    caller plugs in ledger-fetch logic.
+
+OVERVIEW:
+
+	AppealStep        — one hop in the chain.
+	NextProofFn       — caller-supplied successor lookup.
+	WalkAppealChain   — unbounded walker.
+	VerifyAppealChain — per-step proof verification.
+*/
+package verification
+
+import (
+	"fmt"
+
+	"github.com/baseproof/baseproof/anchor"
+	"github.com/baseproof/baseproof/crypto/cosign"
+	"github.com/baseproof/baseproof/types"
+	"github.com/baseproof/baseproof/verifier"
+)
+
+// AppealStep is one hop in an appeal chain. The chain is
+// ordered from the originating (lowest) log to the final
+// (highest) log; Step is 1-indexed.
+type AppealStep struct {
+	// Step is the 1-indexed depth in the chain. The first step
+	// (originating log) is Step=1.
+	Step int
+
+	// CasePos identifies the case-root entry on this log.
+	CasePos types.LogPosition
+
+	// LogDID is the institutional DID of the log holding this
+	// step's case-root entry.
+	LogDID string
+
+	// Outcome echoes the appellate disposition outcome (or empty
+	// for the trial-level origin step).
+	Outcome string
+
+	// Proof is the cross-log proof linking this step to the
+	// previous one. Nil at Step=1 (the origin has no predecessor).
+	Proof *types.CrossLogProof
+
+	// ProofVerified is set by VerifyAppealChain after the proof
+	// passes BLS witness-quorum verification.
+	ProofVerified bool
+}
+
+// NextProofFn is the caller-supplied successor lookup. Given
+// the current step (the chain tail), returns:
+//   - the next AppealStep (with Proof linking back to current),
+//     or nil to terminate the chain.
+//   - any non-nil error halts the walk (ignored if the next
+//     step is nil; the walk simply terminates without error).
+//
+// Production callers wire an ledger-fetch implementation that
+// reads the successor's case-root entry from the next log via
+// the cross-log reference embedded in current's payload.
+type NextProofFn func(current AppealStep) (*AppealStep, error)
+
+// WalkAppealChain constructs the appeal chain by repeatedly
+// calling next() until it returns nil. The chain is unbounded;
+// supports any topology (TN 2-level, TN 3-level with Sup Ct,
+// federal, etc.).
+//
+// The first call yields the origin step (chain length 1);
+// subsequent calls extend the chain. WalkAppealChain assigns
+// Step indices in order.
+//
+// To bound the chain (e.g., reject pathological circular
+// references), wrap next() in a counter that returns nil after
+// a max-depth threshold. The walker itself imposes no cap.
+func WalkAppealChain(origin AppealStep, next NextProofFn) ([]AppealStep, error) {
+	if next == nil {
+		return nil, fmt.Errorf("verification/appellate_history: nil NextProofFn")
+	}
+	origin.Step = 1
+	chain := []AppealStep{origin}
+	for {
+		current := chain[len(chain)-1]
+		nextStep, err := next(current)
+		if err != nil {
+			return chain, fmt.Errorf("verification/appellate_history: walk halted at step %d: %w",
+				current.Step, err)
+		}
+		if nextStep == nil {
+			return chain, nil
+		}
+		nextStep.Step = current.Step + 1
+		chain = append(chain, *nextStep)
+	}
+}
+
+// VerifyAppealChain verifies a sequence of cross-log appeal
+// references. Each step's cross-log proof is verified against
+// the source-log witness key set. Returns the chain with
+// ProofVerified set per step; halts on the first broken link.
+//
+// v0.3.0: witnessSetByLog replaces the v0.1.0 three-map
+// (keys/quorum/networkID) shape. K and NetworkID are encapsulated
+// inside *cosign.WitnessKeySet at construction time so this
+// function cannot read the wrong K for a given source log.
+//
+// SDK-4 (baseproof v1.43.0): trustByLog carries each SOURCE log's pinned
+// burn/equivocation status, keyed by the SAME source-log DID as
+// witnessSetByLog. A missing entry is the zero TrustStatus
+// (Known=false) and fails the hop closed (ErrTrustUnknown) — an
+// unconsulted burn source never trusts by default. Callers build it
+// from the heads journal via trust.StatusFor.
+func VerifyAppealChain(
+	steps []AppealStep,
+	witnessSetByLog map[string]*cosign.WitnessKeySet,
+	trustByLog map[string]verifier.TrustStatus,
+) ([]AppealStep, error) {
+	for i := range steps {
+		if steps[i].Proof == nil {
+			continue
+		}
+		proof := steps[i].Proof
+
+		// ZERO-TRUST (1) — witness set is resolved from the proof's OWN source
+		// log, never from the chain's claimed step.LogDID. A cross-log proof's
+		// SourceTreeHead is cosigned by the SOURCE (lower/referenced) court's
+		// witnesses, so it must be verified against THAT court's set. The DID is
+		// only a lookup key: a forged Source.LogDID resolves to the wrong (or no)
+		// set and fails the quorum check below — it can never trust itself.
+		sourceLogDID := proof.SourceEntry.LogDID
+		set, ok := witnessSetByLog[sourceLogDID]
+		if !ok || set == nil {
+			steps[i].ProofVerified = false
+			continue
+		}
+		if err := anchor.VerifyCrossLog(*proof, set, trustByLog[sourceLogDID]); err != nil {
+			steps[i].ProofVerified = false
+			continue
+		}
+
+		// ZERO-TRUST (2) — chain linkage. The proof must certify exactly the
+		// PREVIOUS step's case (its source entry == steps[i-1].CasePos), else a
+		// sequence of individually-valid-but-unrelated proofs would pass as a
+		// "chain." steps[0] has no predecessor (Proof is nil, skipped above).
+		if i > 0 && proof.SourceEntry != steps[i-1].CasePos {
+			steps[i].ProofVerified = false
+			continue
+		}
+		steps[i].ProofVerified = true
+	}
+
+	// Every non-origin step must have a verified, linked proof.
+	for i := 1; i < len(steps); i++ {
+		if !steps[i].ProofVerified {
+			return steps, fmt.Errorf("verification/appellate_history: broken at step %d",
+				i)
+		}
+	}
+	return steps, nil
+}

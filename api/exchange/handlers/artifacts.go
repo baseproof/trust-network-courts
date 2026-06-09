@@ -1,0 +1,187 @@
+/*
+FILE PATH: exchange/handlers/artifacts.go
+
+DESCRIPTION:
+
+	Artifact lifecycle handlers. The exchange encrypts plaintext
+	locally, computes CID, pushes ciphertext to the artifact store,
+	and returns metadata for the caller to embed in entry Domain Payload.
+
+	POST /v1/artifacts/publish     → encrypt + push → { cid, digest, key }
+	POST /v1/artifacts/{cid}/grant → build + sign + submit grant entry
+
+KEY DEPENDENCIES:
+  - baseproof/crypto/artifact: Encrypt (guide §14)
+  - baseproof/storage: ComputeCID (guide §8.1)
+  - baseproof/crypto: SHA256 (guide §12)
+  - baseproof/lifecycle: GrantArtifactAccess, CheckGrantAuthorization
+    (guide §20.4)
+*/
+package handlers
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/baseproof/baseproof/core/envelope"
+	"github.com/baseproof/baseproof/crypto/artifact"
+	"github.com/baseproof/baseproof/storage"
+
+	auth "github.com/baseproof/trust-network-courts/api/exchange/auth/v2"
+)
+
+// ─── Publish ────────────────────────────────────────────────────────
+
+type ArtifactPublishHandler struct{ deps *Dependencies }
+
+func NewArtifactPublishHandler(deps *Dependencies) *ArtifactPublishHandler {
+	return &ArtifactPublishHandler{deps: deps}
+}
+
+// maxArtifactPlaintextBytes caps the plaintext size accepted by
+// the publish endpoint. Sized for the largest expected court filing
+// PDF (16 MiB typical, 64 MiB ceiling). Mirrors ledger BUG #3:
+// http.MaxBytesReader detects overflow as *http.MaxBytesError and
+// the handler returns 413, rather than silently truncating to a
+// downstream encryption / CID-mismatch error with no attribution.
+const maxArtifactPlaintextBytes int64 = 64 << 20
+
+func (h *ArtifactPublishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_ = auth.SignerDIDFromContext(ctx)
+
+	// Read plaintext from request body. http.MaxBytesReader caps at
+	// maxArtifactPlaintextBytes; oversize requests surface as
+	// *http.MaxBytesError → 413 (BUG #3 mirror).
+	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactPlaintextBytes)
+	plaintext, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("plaintext exceeds %d bytes", maxErr.Limit))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "read body failed")
+		return
+	}
+
+	// Encrypt — SDK generates key internally.
+	ciphertext, artKey, err := artifact.EncryptArtifact(plaintext)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encryption failed")
+		return
+	}
+
+	// Compute CID of ciphertext.
+	cid := storage.Compute(ciphertext)
+
+	// Compute content digest of plaintext.
+	digest := sha256.Sum256(plaintext)
+
+	// Push ciphertext to the boot-wired SDK ContentStore. Single
+	// source of truth — the binary constructs ONE *storage.HTTPContentStore
+	// at boot (cmd/network-api/judicial_deps.go::newContentStore) and
+	// injects it via Dependencies.ContentStore. mTLS material, timeouts,
+	// and the X-Artifact-CID contract live on that one client; the
+	// handler is content-agnostic.
+	if h.deps.ContentStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "artifact store not configured")
+		return
+	}
+	if err := h.deps.ContentStore.Push(ctx, cid, ciphertext); err != nil {
+		writeError(w, http.StatusBadGateway, "artifact store: "+err.Error())
+		return
+	}
+
+	// Return metadata. Caller embeds cid + digest in entry Domain Payload.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cid":            cid.String(),
+		"content_digest": hex.EncodeToString(digest[:]),
+		"encryption_key": base64.StdEncoding.EncodeToString(artKey.Key[:]),
+		"encryption":     "AES-256-GCM",
+	})
+}
+
+// ─── Grant ──────────────────────────────────────────────────────────
+
+type ArtifactGrantHandler struct{ deps *Dependencies }
+
+func NewArtifactGrantHandler(deps *Dependencies) *ArtifactGrantHandler {
+	return &ArtifactGrantHandler{deps: deps}
+}
+
+type GrantRequest struct {
+	GranterDID  string `json:"granter_did"`
+	GranteeDID  string `json:"grantee_did"`
+	ArtifactKey string `json:"artifact_key"` // base64-encoded AES key
+	SchemaRef   string `json:"schema_ref"`
+}
+
+func (h *ArtifactGrantHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	callerDID := auth.SignerDIDFromContext(r.Context())
+	cid := r.PathValue("cid")
+
+	var req GrantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if req.GranterDID == "" {
+		req.GranterDID = callerDID
+	}
+
+	// Build grant entry via SDK.
+	grantPayload, _ := json.Marshal(map[string]any{
+		"artifact_cid":   cid,
+		"granter_did":    req.GranterDID,
+		"grantee_did":    req.GranteeDID,
+		"decryption_key": req.ArtifactKey,
+		"schema_ref":     req.SchemaRef,
+	})
+
+	// Build as commentary entry carrying the grant.
+	buildReq := BuildRequest{
+		Builder:       "commentary",
+		SignerDID:     req.GranterDID,
+		DomainPayload: grantPayload,
+	}
+
+	entry, err := dispatchBuilder(buildReq)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "grant build failed")
+		return
+	}
+
+	// Sign with the granter's custodied secp256k1 key and EMBED the
+	// signature in the envelope (sig over sha256(SigningPayload), the
+	// digest the SDK's VerifyEntrySignatures checks); then serialize the
+	// hydrated entry.
+	digest := sha256.Sum256(envelope.SigningPayload(entry))
+	sig, err := h.deps.KeyStore.SignEntry(req.GranterDID, digest)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "grant signing failed")
+		return
+	}
+	entry.Signatures = []envelope.Signature{{
+		SignerDID: req.GranterDID,
+		AlgoID:    envelope.SigAlgoECDSA,
+		Bytes:     sig,
+	}}
+	signed, err := envelope.Serialize(entry)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "grant serialize failed")
+		return
+	}
+
+	// Submit to ledger via shared SDK-tuned client (see
+	// management.go::ledgerSubmitClient) plus  breaker
+	// +  metrics when wired.
+	submitToLedgerProtected(w, h.deps, signed)
+}

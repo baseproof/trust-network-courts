@@ -1,0 +1,99 @@
+/*
+FILE PATH: appeals/initiation.go
+DESCRIPTION: Notice of appeal → root entity on appellate court's cases log.
+KEY ARCHITECTURAL DECISIONS:
+  - BuildRootEntity on appellate log (separate from lower court log).
+  - BuildCrossLogProof proves lower court case exists and is final.
+  - Domain Payload: lower_court_did, lower_court_case_pos, appeal_grounds.
+  - References lower court's case schema (no dedicated appellate schema).
+
+OVERVIEW: FileAppeal → root entity + cross-log proof.
+KEY DEPENDENCIES: baseproof/builder, baseproof/verifier
+*/
+package appeals
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/baseproof/baseproof/builder"
+	"github.com/baseproof/baseproof/core/envelope"
+	"github.com/baseproof/baseproof/types"
+	"github.com/baseproof/baseproof/verifier"
+
+	"github.com/baseproof/trust-network-courts/schemas"
+)
+
+type AppealInitiationConfig struct {
+	Destination       string // DID of target exchange. Required.
+	SignerDID         string
+	LowerCourtCasePos types.LogPosition
+	LowerCourtDID     string
+	AppealNumber      string
+	AppealGrounds     string
+	SchemaRef         *types.LogPosition
+	EventTime         int64
+
+	// AttestationPolicyName, when non-nil and non-empty, adopts a
+	// named policy declared on the appeal-initiation schema. nil
+	// = no policy.
+	AttestationPolicyName *string
+}
+
+type AppealInitiationResult struct {
+	AppealEntry   *envelope.Entry
+	CrossLogProof *types.CrossLogProof
+}
+
+// FileAppeal creates a notice of appeal on the appellate court's cases log.
+// Includes a cross-log proof demonstrating the lower court case exists.
+// ctx threads into the fetcher / prover RPCs that compose the cross-log proof.
+func FileAppeal(
+	ctx context.Context,
+	cfg AppealInitiationConfig,
+	fetcher types.EntryFetcher,
+	sourceProver verifier.MerkleProver,
+	localProver verifier.MerkleProver,
+	sourceHead types.CosignedTreeHead,
+	localHead types.CosignedTreeHead,
+	anchorRef types.LogPosition,
+) (*AppealInitiationResult, error) {
+	if cfg.SignerDID == "" {
+		return nil, fmt.Errorf("appeals/initiation: empty signer DID")
+	}
+
+	// Build cross-log proof for the lower court case.
+	proof, err := verifier.BuildCrossLogProof(ctx,
+		cfg.LowerCourtCasePos, anchorRef, fetcher,
+		sourceProver, localProver, sourceHead, localHead,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("appeals/initiation: cross-log proof: %w", err)
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"appeal_number":        cfg.AppealNumber,
+		"appeal_grounds":       cfg.AppealGrounds,
+		"lower_court_did":      cfg.LowerCourtDID,
+		"lower_court_case_seq": cfg.LowerCourtCasePos.Sequence,
+		"status":               "pending",
+	})
+
+	entry, err := builder.BuildRootEntity(builder.RootEntityParams{
+		Destination: cfg.Destination,
+		SignerDID:   cfg.SignerDID,
+		Payload:     payload,
+		SchemaRef:   cfg.SchemaRef,
+		EventTime:   cfg.EventTime,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("appeals/initiation: build root entity: %w", err)
+	}
+	schemas.SetAttestationPolicy(entry, cfg.AttestationPolicyName)
+
+	return &AppealInitiationResult{
+		AppealEntry:   entry,
+		CrossLogProof: proof,
+	}, nil
+}

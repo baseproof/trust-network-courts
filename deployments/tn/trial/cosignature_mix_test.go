@@ -1,0 +1,330 @@
+/*
+FILE PATH: deployments/tn/trial/cosignature_mix_test.go
+
+DESCRIPTION:
+
+	Tests for the TN trial cosignature-mix fixture. Lifted from
+	internal/testfixtures/davidsonlegacy/cosignature_mix_test.go and
+	re-scoped to the shared TN trial framework. Pins:
+	  - Every rule validates structurally (via NewInMemoryPolicy).
+	  - Every FilerRole from the v1.8 dictionary appears at least
+	    once (the fixture covers the full Filer surface).
+	  - Pure Signer-only events have no AllowedFilerRoles.
+	  - Personnel events require ≥2 cosigners.
+	  - Cross-exchange events have IntraExchangeOnly=false.
+	  - Specific event lookups return expected shapes.
+*/
+package trial
+
+import (
+	"testing"
+
+	"github.com/baseproof/trust-network-courts/policy"
+	"github.com/baseproof/trust-network-courts/schemas"
+)
+
+// ─── §0 case genesis ───────────────────────────────────────────────
+
+// TestCosignatureRules_CaseInitiation pins the genesis rule the
+// now-wired submit gate enforces: opening a case requires one
+// intra-exchange court_clerk cosignature. case_initiation is the
+// prereq ancestor every later case-lifecycle event depends on, so
+// its absence from the cosignature catalog would fail-close every
+// case opening (unknown_event_type) once the gate is live.
+func TestCosignatureRules_CaseInitiation(t *testing.T) {
+	rule, err := MustCosignaturePolicy().Lookup("case_initiation")
+	if err != nil {
+		t.Fatalf("Lookup(case_initiation): %v", err)
+	}
+	if rule.MinSignerCosigners != 1 {
+		t.Errorf("MinSignerCosigners = %d, want 1", rule.MinSignerCosigners)
+	}
+	if !rule.IntraExchangeOnly {
+		t.Error("case_initiation must be IntraExchangeOnly")
+	}
+	if !rule.PermitsSignerRole("court_clerk") {
+		t.Error("case_initiation must permit a court_clerk cosigner")
+	}
+	if rule.RequiresFiler() {
+		t.Error("case_initiation is signer-only; it must not require a filed_by_capacity")
+	}
+}
+
+// ─── basic invariants ──────────────────────────────────────────────
+
+func TestCosignatureRules_AllValid(t *testing.T) {
+	if _, err := policy.NewInMemoryPolicy(CosignatureRules()); err != nil {
+		t.Errorf("TN trial cosig rules failed to construct: %v", err)
+	}
+}
+
+func TestMustCosignaturePolicy_DoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("MustCosignaturePolicy panicked: %v", r)
+		}
+	}()
+	p := MustCosignaturePolicy()
+	if got := len(p.List()); got == 0 {
+		t.Error("TN trial cosig policy should have rules")
+	}
+}
+
+func TestMustCosignaturePolicy_IndependentCalls(t *testing.T) {
+	a := MustCosignaturePolicy()
+	b := MustCosignaturePolicy()
+	if a == b {
+		t.Error("MustCosignaturePolicy should return a fresh policy per call")
+	}
+}
+
+// ─── coverage of every FilerRole ───────────────────────────────────
+
+func TestCosignatureRules_CoversEveryFilerRole(t *testing.T) {
+	want := map[schemas.FilerRole]bool{
+		schemas.FilerRoleProsecutor:      false,
+		schemas.FilerRoleDefenseCounsel:  false,
+		schemas.FilerRoleCivilAttorney:   false,
+		schemas.FilerRoleFiduciary:       false,
+		schemas.FilerRoleGuardianAdLitem: false,
+	}
+	for _, r := range CosignatureRules() {
+		for _, fr := range r.AllowedFilerRoles {
+			want[fr] = true
+		}
+	}
+	for fr, present := range want {
+		if !present {
+			t.Errorf("FilerRole %q not covered by any TN trial rule", fr)
+		}
+	}
+}
+
+// ─── pure Signer-only events ───────────────────────────────────────
+
+func TestCosignatureRules_PureSignerEventsHaveNoFilers(t *testing.T) {
+	pureSigner := []string{"verdict", "final_judgment", "transcript_publication"}
+	p := MustCosignaturePolicy()
+	for _, ev := range pureSigner {
+		r, err := p.Lookup(ev)
+		if err != nil {
+			t.Errorf("%s missing: %v", ev, err)
+			continue
+		}
+		if r.RequiresFiler() {
+			t.Errorf("%s must not require a filer; got AllowedFilerRoles=%v",
+				ev, r.AllowedFilerRoles)
+		}
+	}
+}
+
+// ─── personnel events: ≥2 cosigners, intra-exchange ────────────────
+
+func TestCosignatureRules_PersonnelEventsRequireMultipleCosigners(t *testing.T) {
+	personnel := []string{
+		"judicial_appointment",
+		"clerk_appointment",
+		"court_reporter_appointment",
+	}
+	p := MustCosignaturePolicy()
+	for _, ev := range personnel {
+		r, err := p.Lookup(ev)
+		if err != nil {
+			t.Errorf("%s missing: %v", ev, err)
+			continue
+		}
+		if r.MinSignerCosigners < 2 {
+			t.Errorf("%s must require ≥2 cosigners; got %d",
+				ev, r.MinSignerCosigners)
+		}
+		if !r.IntraExchangeOnly {
+			t.Errorf("%s must be intra-exchange-only", ev)
+		}
+	}
+}
+
+// ─── cross-exchange events: IntraExchangeOnly=false ────────────────
+
+func TestCosignatureRules_CrossExchangeEventsFlagSetCorrectly(t *testing.T) {
+	crossExchange := []string{
+		"case_transfer_outbound",
+		"case_transfer_inbound",
+		"relay_attestation",
+	}
+	p := MustCosignaturePolicy()
+	for _, ev := range crossExchange {
+		r, err := p.Lookup(ev)
+		if err != nil {
+			t.Errorf("%s missing: %v", ev, err)
+			continue
+		}
+		if r.IntraExchangeOnly {
+			t.Errorf("%s must be cross-exchange-permitted (IntraExchangeOnly=false)", ev)
+		}
+	}
+}
+
+// ─── attorney filings: bpr_number required ─────────────────────────
+
+func TestCosignatureRules_AttorneyFilingsRequireBPR(t *testing.T) {
+	// motion_continuance / motion_summary_judgment /
+	// motion_state_dismissal flow through the §3 helpers
+	// (motions_3X.go); their bpr_number is the helper default.
+	// This test pins the BASE attorney-filed events (responsive
+	// pleading) plus a representative §3-helper event.
+	attorneyFilings := []string{
+		"responsive_pleading",
+		"motion_summary_judgment", // via §3B helper
+	}
+	p := MustCosignaturePolicy()
+	for _, ev := range attorneyFilings {
+		r, err := p.Lookup(ev)
+		if err != nil {
+			t.Errorf("%s missing: %v", ev, err)
+			continue
+		}
+		found := false
+		for _, c := range r.RequiredCredentials {
+			if c == "bpr_number" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s must require bpr_number; RequiredCredentials=%v",
+				ev, r.RequiredCredentials)
+		}
+	}
+}
+
+// ─── fiduciary filings: letters_of_administration_ref required ─────
+
+func TestCosignatureRules_FiduciaryFilingsRequireLetters(t *testing.T) {
+	fiduciaryFilings := []string{
+		"fiduciary_accounting",
+		"asset_disposition_order",
+	}
+	p := MustCosignaturePolicy()
+	for _, ev := range fiduciaryFilings {
+		r, err := p.Lookup(ev)
+		if err != nil {
+			t.Errorf("%s missing: %v", ev, err)
+			continue
+		}
+		found := false
+		for _, c := range r.RequiredCredentials {
+			if c == "letters_of_administration_ref" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s must require letters_of_administration_ref; got %v",
+				ev, r.RequiredCredentials)
+		}
+		if !r.PermitsFilerRole(schemas.FilerRoleFiduciary) {
+			t.Errorf("%s must permit fiduciary filer role", ev)
+		}
+	}
+}
+
+// ─── guardian ad litem: appointment_order_ref required ─────────────
+
+func TestCosignatureRules_GuardianAdLitemRequiresAppointment(t *testing.T) {
+	r, err := MustCosignaturePolicy().Lookup("appointment_guardian_ad_litem")
+	if err != nil {
+		t.Fatalf("appointment_guardian_ad_litem missing: %v", err)
+	}
+	found := false
+	for _, c := range r.RequiredCredentials {
+		if c == "appointment_order_ref" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("must require appointment_order_ref; got %v", r.RequiredCredentials)
+	}
+	if !r.PermitsFilerRole(schemas.FilerRoleGuardianAdLitem) {
+		t.Errorf("must permit guardian_ad_litem filer role")
+	}
+}
+
+// motion_continuance lives in §3G now; multi-filer pin moved
+// to motions_3g_test.go when that section lands.
+
+// TestCosignatureRules_ExpectedCount pins the rule count so an
+// accidental addition / deletion shows up in CI. Total = 19 base
+// + every §3 motion declared. History:
+//   17 → 14: motion_continuance / motion_summary_judgment /
+//            motion_state_dismissal moved into §3 helpers.
+//   14 → 15: §0 case_initiation genesis rule added.
+//   15 → 19: Issue #67 Part A added §6 Court Orders 4 rules
+//            (scheduling_order, interlocutory_order,
+//             protective_restraining_order, warrant_issuance_return).
+//   19 → 23: Issue #67 Part B added §15 Schema Lifecycle 4 events
+//            (schema_publication, schema_adoption, schema_amendment,
+//             schema_deprecation).
+//   23 → 28: Issue #67 Part C added §16 Network Topology 5 events
+//            (anchor_registration, mirror_creation, mirror_revocation,
+//             network_fork, scope_division_creation).
+//   28 → 30: Issue #67 Part D added §14 Crypto & Key Maintenance 2
+//            events (institutional_key_rotation,
+//             mofn_escrow_recovery_execution).
+func TestCosignatureRules_ExpectedCount(t *testing.T) {
+	const baseRules = 30
+	want := baseRules + len(motionCosignatureRules())
+	if got := len(CosignatureRules()); got != want {
+		t.Errorf("TN trial cosig rule count: want %d, got %d", want, got)
+	}
+}
+
+// ─── v1.8 actor simplification: no chief_justice ──────────────────
+
+// TestCosignatureRules_NoNonV18Roles guarantees no non-v1.8 role
+// names slip into the cosig fixture. The simplified TN trial role
+// catalog has 3 names: judge, court_clerk, court_reporter. Any
+// other RequiredSignerRoles entry indicates drift.
+func TestCosignatureRules_NoNonV18Roles(t *testing.T) {
+	allowed := map[string]bool{
+		"judge":          true,
+		"court_clerk":    true,
+		"court_reporter": true,
+	}
+	for _, r := range CosignatureRules() {
+		for _, role := range r.RequiredSignerRoles {
+			if !allowed[role] {
+				t.Errorf("rule %q references non-v1.8 role %q",
+					r.EventType, role)
+			}
+		}
+	}
+}
+
+// TestCosignatureRules_PersonnelEventsJudgeOnly pins that the
+// personnel events (judicial_appointment, clerk_appointment,
+// court_reporter_appointment) require ONLY judge cosignatures —
+// chief_justice has been retired per the v1.8 simplification.
+func TestCosignatureRules_PersonnelEventsJudgeOnly(t *testing.T) {
+	personnel := []string{
+		"judicial_appointment",
+		"clerk_appointment",
+		"court_reporter_appointment",
+	}
+	p := MustCosignaturePolicy()
+	for _, ev := range personnel {
+		r, err := p.Lookup(ev)
+		if err != nil {
+			t.Errorf("%s missing: %v", ev, err)
+			continue
+		}
+		if len(r.RequiredSignerRoles) != 1 || r.RequiredSignerRoles[0] != "judge" {
+			t.Errorf("%s RequiredSignerRoles drift: want [judge], got %v",
+				ev, r.RequiredSignerRoles)
+		}
+		if r.MinSignerCosigners < 2 {
+			t.Errorf("%s must require ≥2 cosigners (intra-exchange judges); got %d",
+				ev, r.MinSignerCosigners)
+		}
+	}
+}

@@ -1,0 +1,59 @@
+# trust-network-courts — JN auditor (network-api) as a container.
+#
+# Driven by scripts/run-jn.sh (docker default). The binary is env-driven, so
+# this compose is just one deployment of it — a k8s Deployment sets the SAME
+# env + mounts the SAME files, only the paths differ. Nothing JN-specific is
+# baked into the image.
+#
+# Reaches the host-run ledger + the external auditor via host.docker.internal
+# (both run on the host / sibling compose, like the ledger's own dev flow). The
+# JN does NOT talk to witness endpoints — it resolves witness keys from the
+# (mounted) bootstrap, so no witness host wiring is needed.
+#
+# Separation of Duties: the JN is the ENFORCER. It re-verifies what it pulls from
+# the auditor's /v1/gossip feed; it hosts NO custody (no gossip store, no feed,
+# no equivocation scanner). Custody lives in the external auditor service.
+#
+# Inputs from the environment (run-jn.sh exports them):
+#   JN_BOOTSTRAP_FILE          abs host path to network-bootstrap.json (mounted ro)
+#   JN_WITNESS_QUORUM_K        K-of-N quorum for the bootstrap-derived witness set
+#   API_GOSSIP_INGEST_PEER_URL the auditor's /v1/gossip base URL (verify-only source)
+
+name: jn-auditor
+
+services:
+  network-api:
+    # run-jn.sh provisions this image (pull when JN_IMAGE_PULL=1, else a local
+    # build it tags as JN_IMAGE), so the compose only references it — no build:.
+    image: "${JN_IMAGE:-ghcr.io/baseproof/trust-network-courts:${JN_IMAGE_TAG:-dev}}"
+    container_name: jn-network-api
+    ports:
+      - "8443:8443"
+    environment:
+      API_LISTEN_ADDR: ":8443"
+      # The ledger is the JN's hard dependency — probed at boot. From inside the
+      # container the host-run ledger is host.docker.internal.
+      API_LEDGER_ENDPOINT: "${API_LEDGER_ENDPOINT:-http://host.docker.internal:8080}"
+      # Shared trust root (mounted) → witness sets for verify-only ingest.
+      API_NETWORK_BOOTSTRAP_FILE: "/run/jn/bootstrap.json"
+      API_WITNESS_QUORUM_K: "${JN_WITNESS_QUORUM_K:-5}"
+      # Verify-only inbound anti-entropy (Separation of Duties): the JN PULLS the
+      # external auditor's curated /v1/gossip feed (its detection findings +
+      # relayed gossip) and RE-VERIFIES every event against JN-local trust. The
+      # JN hosts NO custody — no store, no feed, no equivocation scanner.
+      API_GOSSIP_INGEST_ENABLED: "true"
+      API_GOSSIP_INGEST_PEER_URL: "${API_GOSSIP_INGEST_PEER_URL:-http://host.docker.internal:8088}"
+      # mTLS material (mounted Secret in k8s; .run/certs here). Zero-trust.
+      API_AUTH_CLIENT_CA_FILE: "/run/jn/certs/ca.crt"
+      API_AUTH_TLS_CERT_FILE: "/run/jn/certs/server.crt"
+      API_AUTH_TLS_KEY_FILE: "/run/jn/certs/server.key"
+    volumes:
+      - ../../.run/certs:/run/jn/certs:ro
+      # Default keeps `docker compose down` (and any unset invocation) parseable;
+      # run-jn.sh always sets JN_BOOTSTRAP_FILE for `up`.
+      - "${JN_BOOTSTRAP_FILE:-/dev/null}:/run/jn/bootstrap.json:ro"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # No container healthcheck: /healthz is behind mTLS (RequireAndVerifyClientCert),
+    # so a probe without a client cert is rejected by design. Verify health
+    # externally with a client cert (see run-jn.sh banner).

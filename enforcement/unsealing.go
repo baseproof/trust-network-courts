@@ -1,0 +1,85 @@
+/*
+FILE PATH: enforcement/unsealing.go
+DESCRIPTION: Path C unsealing order with cosignature requirement.
+KEY ARCHITECTURAL DECISIONS:
+  - Requires cosignature from another judge (threshold=1 per sealing schema).
+  - Uses lifecycle.BuildApprovalCosignature for the cosignature entry.
+  - Same activation pattern: conditions → contest check → activate.
+
+OVERVIEW: UnsealCase → enforcement entry. RequestUnsealCosignature → cosig.
+KEY DEPENDENCIES: baseproof/builder, baseproof/lifecycle, baseproof/verifier
+*/
+package enforcement
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/baseproof/baseproof/builder"
+	"github.com/baseproof/baseproof/core/envelope"
+	"github.com/baseproof/baseproof/lifecycle"
+	"github.com/baseproof/baseproof/types"
+
+	"github.com/baseproof/trust-network-courts/schemas"
+)
+
+type UnsealingConfig struct {
+	Destination    string // DID of target exchange. Required.
+	JudgeDID       string
+	CaseRootPos    types.LogPosition
+	ScopePos       types.LogPosition
+	PriorAuthority *types.LogPosition
+	SchemaRef      *types.LogPosition
+	Reason         string
+	EventTime      int64
+
+	// AttestationPolicyName, when non-nil and non-empty, adopts the
+	// named policy declared on the sealing-order schema. Typical
+	// value: schemas.PolicySealingOrderConcurrence.
+	AttestationPolicyName *string
+}
+
+// UnsealCase publishes an unsealing enforcement entry (Path C).
+// Unsealing requires cosignature_threshold=1 per tn-sealing-order-v1.
+// The cosignature must be collected via RequestUnsealCosignature before
+// the unsealing activation entry can be published.
+func UnsealCase(cfg UnsealingConfig) (*SealingResult, error) {
+	if cfg.JudgeDID == "" {
+		return nil, fmt.Errorf("enforcement/unsealing: empty judge DID")
+	}
+	if cfg.CaseRootPos.IsNull() || cfg.ScopePos.IsNull() {
+		return nil, fmt.Errorf("enforcement/unsealing: null position")
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"order_type": "unseal",
+		"reason":     cfg.Reason,
+	})
+
+	entry, err := builder.BuildEnforcement(builder.EnforcementParams{
+		Destination:    cfg.Destination,
+		SignerDID:      cfg.JudgeDID,
+		TargetRoot:     cfg.CaseRootPos,
+		ScopePointer:   cfg.ScopePos,
+		PriorAuthority: cfg.PriorAuthority,
+		Payload:        payload,
+		SchemaRef:      cfg.SchemaRef,
+		EventTime:      cfg.EventTime,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enforcement/unsealing: build enforcement: %w", err)
+	}
+	schemas.SetAttestationPolicy(entry, cfg.AttestationPolicyName)
+
+	return &SealingResult{EnforcementEntry: entry}, nil
+}
+
+// RequestUnsealCosignature creates a cosignature entry from a second judge
+// approving the unsealing order. Required because cosignature_threshold=1.
+func RequestUnsealCosignature(
+	cosignerDID string, destination string,
+	unsealingEntryPos types.LogPosition,
+	eventTime int64,
+) (*envelope.Entry, error) {
+	return lifecycle.BuildApprovalCosignature(cosignerDID, destination, unsealingEntryPos, eventTime)
+}

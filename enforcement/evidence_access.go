@@ -1,0 +1,97 @@
+/*
+FILE PATH: enforcement/evidence_access.go
+DESCRIPTION: Sealed evidence access enforcement. Bridge between judicial
+
+	enforcement logic and SDK artifact access.
+
+KEY ARCHITECTURAL DECISIONS:
+  - Reads disclosure orders from authority chain to assemble recipient list.
+  - Passes to GrantArtifactAccess sealed mode.
+  - Uses did_keys.ResolveEncryptionKey for recipient key resolution.
+  - Wraps retrieve.go with enforcement-layer policy.
+
+OVERVIEW: GrantEvidenceAccess → sealed-mode artifact grant with enforcement checks.
+KEY DEPENDENCIES: baseproof/lifecycle, cases/artifact
+*/
+package enforcement
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/baseproof/baseproof/core/smt"
+	sdkartifact "github.com/baseproof/baseproof/crypto/artifact"
+	"github.com/baseproof/baseproof/did"
+	lifecycleartifact "github.com/baseproof/baseproof/lifecycle/artifact"
+	"github.com/baseproof/baseproof/schema"
+	"github.com/baseproof/baseproof/storage"
+	"github.com/baseproof/baseproof/types"
+
+	"github.com/baseproof/trust-network-courts/cases/artifact"
+)
+
+type EvidenceAccessConfig struct {
+	Destination     string // DID of target exchange. Required.
+	ArtifactCID     storage.CID
+	ContentDigest   storage.CID
+	FilingEntryPos  types.LogPosition
+	CaseRootPos     types.LogPosition
+	ScopePos        types.LogPosition
+	RequesterPubKey []byte
+	RequesterDID    string
+	GranterDID      string
+	SchemaRef       types.LogPosition
+	OwnerMasterKey  []byte
+	PkDel           []byte
+	Capsule         *sdkartifact.Capsule
+}
+
+// GrantEvidenceAccess wraps artifact.RetrieveArtifact with enforcement-layer
+// policy for sealed evidence. Resolves recipient encryption key via
+// did_keys.ResolveEncryptionKey and delegates to the SDK's sealed-mode grant.
+func GrantEvidenceAccess(
+	ctx context.Context,
+	cfg EvidenceAccessConfig,
+	keyStore lifecycleartifact.KeyStore,
+	delKeyStore artifact.DelegationKeyStore,
+	retrievalProvider storage.RetrievalProvider,
+	extractor schema.SchemaParameterExtractor,
+	leafReader smt.LeafReader,
+	fetcher types.EntryFetcher,
+	resolver did.DIDResolver,
+) (*lifecycleartifact.GrantResult, error) {
+	if cfg.RequesterDID == "" {
+		return nil, fmt.Errorf("enforcement/evidence_access: empty requester DID")
+	}
+
+	// Resolve requester's encryption key via did_keys (keyAgreement purpose).
+	requesterPubKey := cfg.RequesterPubKey
+	if len(requesterPubKey) == 0 && resolver != nil {
+		pk, err := artifact.ResolveEncryptionKey(ctx, cfg.RequesterDID, resolver)
+		if err != nil {
+			return nil, fmt.Errorf("enforcement/evidence_access: resolve requester key: %w", err)
+		}
+		requesterPubKey = pk
+	}
+
+	return artifact.RetrieveArtifact(
+		ctx,
+		artifact.RetrievalRequest{
+			Destination:     cfg.Destination,
+			ArtifactCID:     cfg.ArtifactCID,
+			ContentDigest:   cfg.ContentDigest,
+			FilingEntryPos:  cfg.FilingEntryPos,
+			CaseRootPos:     cfg.CaseRootPos,
+			ScopePos:        cfg.ScopePos,
+			RequesterPubKey: requesterPubKey,
+			RequesterDID:    cfg.RequesterDID,
+			GranterDID:      cfg.GranterDID,
+			SchemaRef:       cfg.SchemaRef,
+			OwnerMasterKey:  cfg.OwnerMasterKey,
+			PkDel:           cfg.PkDel,
+			Capsule:         cfg.Capsule,
+		},
+		keyStore, delKeyStore, retrievalProvider, extractor,
+		leafReader, fetcher, resolver,
+	)
+}

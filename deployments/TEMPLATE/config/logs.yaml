@@ -1,0 +1,14 @@
+# Log Configuration Template
+# Three logs per court: officers, cases, parties.
+
+officers:
+  did: "did:web:courts.JURISDICTION.gov:officers"
+  ledger_endpoint: "https://ledger.JURISDICTION.gov/v1"
+
+cases:
+  did: "did:web:courts.JURISDICTION.gov:cases"
+  ledger_endpoint: "https://ledger.JURISDICTION.gov/v1"
+
+parties:
+  did: "did:web:courts.JURISDICTION.gov:parties"
+  ledger_endpoint: "https://ledger.JURISDICTION.gov/v1"
