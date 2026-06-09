@@ -22,7 +22,7 @@ WALK_COMPOSE := docker compose -f deployment/local/docker-compose.walkthrough.ym
         audit-sdk lint judicial-cli network-api court-tools provider-tools \
         aggregator install-bins \
         walkthrough-up walkthrough-down walkthrough-logs walkthrough-status \
-        e2e smoke
+        e2e bootstrap smoke
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -65,6 +65,9 @@ aggregator: ## Build tools/aggregator into ./bin/
 e2e: ## Build cmd/e2e (the Go end-to-end stack runner: up/run/status/wipe) into ./bin/
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/e2e ./cmd/e2e
+
+bootstrap: ## Bootstrap a FULL local network from scratch (PRESET=single|federation|mega; default single)
+	./scripts/bootstrap.sh $(PRESET)
 
 # The standalone witness daemon lives in its own repo
 # (github.com/baseproof/standalone-witness — extracted from
@@ -163,12 +166,14 @@ walkthrough-up: install-bins ## Boot the JN-side tools layer (court-tools + prov
 walkthrough-down: ## Tear down the JN-side tools layer
 	$(WALK_COMPOSE) down -v
 
-# The full GHCR-image stack (witnesses → ledger → auditor → aggregator → JN) is
-# brought up by the Go runner, `make e2e` then ./bin/e2e:
+# A full local stack (witnesses → ledger → auditor → aggregator → JN) is brought
+# up by the Go runner. Quickest path: `make bootstrap` (= scripts/bootstrap.sh),
+# or drive it directly with `make e2e` then ./bin/e2e:
 #     ./bin/e2e up federation        # bring up + persist a federated stack
 #     ./bin/e2e run federation.soak  # run a recipe against it
 #     ./bin/e2e status | wipe        # inspect / tear down
-# (see cmd/e2e — `./bin/e2e help`).
+# (see cmd/e2e — `./bin/e2e help`). JN/aggregator images are built locally from
+# deployment/local/Dockerfile.*; only the tooling fleet is pulled from ghcr.io.
 
 walkthrough-logs: ## Tail logs from court-tools + provider-tools
 	$(WALK_COMPOSE) logs -f
